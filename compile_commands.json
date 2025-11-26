@@ -1,0 +1,9 @@
+[
+    {
+        "directory": "/home/chronos/repos/dpp-opdracht-3",
+        "command": "mpicc -I/usr/lib/x86_64-linux-gnu/openmpi/include -c simulate.c",
+        "file": "simulate.c"
+    }
+]
+
+
