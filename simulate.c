@@ -138,17 +138,14 @@ double *simulate(const int i_max, const int t_max, double *old_array,
 	init_local_domain(rank, size, i_max, old_array, current_array,
 			&local_n, &start_index, &local_old, &local_current, &local_next);
 
-	// Determine neighbors.
 	int left_neighbour = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
 	int right_neighbour = (rank < size - 1) ? rank + 1 : MPI_PROC_NULL;
 
-	// Main simulation loop.
 	for (int t = 0; t < t_max; t++) {
 		exchange_halos(local_current, local_n, left_neighbour, right_neighbour);
 		compute_wave_step(local_old, local_current, local_next,
 				local_n, start_index, i_max);
 
-		// Rotate buffers.
 		double *temp = local_old;
 		local_old = local_current;
 		local_current = local_next;
