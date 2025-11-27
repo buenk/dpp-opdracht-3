@@ -8,6 +8,7 @@
  * Authors: Ezra Buenk, Anais Marelis.
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <mpi.h>
 #include "simulate.h"
@@ -132,6 +133,9 @@ double *simulate(const int i_max, const int t_max, double *old_array,
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+	// Start timing after MPI init
+	double start_time = MPI_Wtime();
+
 	// Initialize local domain.
 	int local_n, start_index;
 	double *local_old, *local_current, *local_next;
@@ -173,6 +177,15 @@ double *simulate(const int i_max, const int t_max, double *old_array,
 	MPI_Gatherv(&local_current[1], local_n, MPI_DOUBLE,
 	            current_array, recvcounts, displs, MPI_DOUBLE,
 	            0, MPI_COMM_WORLD);
+
+	// End timing before MPI finalize.
+	double end_time = MPI_Wtime();
+	double compute_time = end_time - start_time;
+
+	// Print actual computation time (excluding MPI_Init/Finalize overhead)
+	if (rank == 0) {
+		printf("Compute time: %g seconds\n", compute_time);
+	}
 
 	free(local_old);
 	free(local_current);
