@@ -1,9 +1,13 @@
 /*
- * simulate.c
+ * simulate_v2.c
  *
  * Contains the implementation of the main simulation logic,
  * including parallelization of computations for the wave equation
  * using MPI for distributed computing.
+ *
+ * This version uses fully non-blocking communication (non-blocking send
+ * and non-blocking receive) to maximize overlap of communication with
+ * computation.
  *
  * Authors: Ezra Buenk, Anais Marelis.
  */
@@ -15,8 +19,8 @@
 
 
 /*
- * Initializes the local domain for this MPI process. Calculates the chunk
- * this process is responsible for and allocates local arrays with halo cells.
+ * Initializes local domain for this MPI process. Calculates the chunk
+ * this process is responsible for and allocates local arrays with halos.
  *
  * rank: MPI rank of this process
  * size: total number of MPI processes
@@ -70,54 +74,70 @@ static void init_local_domain(
 }
 
 /*
- * Exchanges halo cells with neighboring processes using blocking MPI calls.
+ * Initiates all non-blocking communication for halo exchange.
+ * Returns after posting the sends and receives.
  *
- * local_current: local array containing current wave data with halo cells
+ * local_current: local array containing current wave data with halos
  * local_n: number of local data points (excluding halos)
  * left_neighbour: MPI rank of left neighbour (or MPI_PROC_NULL)
  * right_neighbour: MPI rank of right neighbour (or MPI_PROC_NULL)
+ * requests: array of 4 MPI_Request handles (output)
  */
-static void exchange_halos(
+static void start_all_halo_comm(
 	double *local_current,
 	int local_n,
 	int left_neighbour,
-	int right_neighbour
+	int right_neighbour,
+	MPI_Request *requests
 ) {
-	// Send leftmost real cell to left neighbour, receive right halo from right neighbour.
-	MPI_Sendrecv(
+	// Send leftmost real cell to left neighbour (non-blocking).
+	MPI_Isend(
 		&local_current[1],
 		1,
 		MPI_DOUBLE,
 		left_neighbour,
 		0,
-		&local_current[local_n + 1],
-		1,
-		MPI_DOUBLE,
-		right_neighbour,
-		0,
 		MPI_COMM_WORLD,
-		MPI_STATUS_IGNORE
+		&requests[0]
 	);
 
-	// Send rightmost real cell to right neighbour, receive left halo from left neighbour.
-	MPI_Sendrecv(
+	// Send rightmost real cell to right neighbour (non-blocking).
+	MPI_Isend(
 		&local_current[local_n],
 		1,
 		MPI_DOUBLE,
 		right_neighbour,
 		1,
+		MPI_COMM_WORLD,
+		&requests[1]
+	);
+
+	// Receive left halo from left neighbour (non-blocking).
+	MPI_Irecv(
 		&local_current[0],
 		1,
 		MPI_DOUBLE,
 		left_neighbour,
 		1,
 		MPI_COMM_WORLD,
-		MPI_STATUS_IGNORE
+		&requests[2]
+	);
+
+	// Receive right halo from right neighbour (non-blocking).
+	MPI_Irecv(
+		&local_current[local_n + 1],
+		1,
+		MPI_DOUBLE,
+		right_neighbour,
+		0,
+		MPI_COMM_WORLD,
+		&requests[3]
 	);
 }
 
 /*
- * Computes one time step of the wave equation for the local domain.
+ * Calculates the inside cells of the wave equation (no halo dependencies).
+ * These are cells from index 2 to local_n-1.
  *
  * local_old: local array containing wave data for t-1
  * local_current: local array containing wave data for t
@@ -126,7 +146,7 @@ static void exchange_halos(
  * start_index: global starting index for this process's chunk
  * i_max: total number of data points on a single wave
  */
-static void compute_wave_step(
+static void compute_interior(
 	double *local_old,
 	double *local_current,
 	double *local_next,
@@ -136,7 +156,7 @@ static void compute_wave_step(
 ) {
 	const double c = 0.15;
 
-	for (int i = 1; i <= local_n; i++) {
+	for (int i = 2; i <= local_n - 1; i++) {
 		int global_i = start_index + (i - 1);
 		if (global_i == 0 || global_i == i_max - 1) {
 			local_next[i] = 0.0;
@@ -149,9 +169,58 @@ static void compute_wave_step(
 }
 
 /*
+ * Computes the border cells of the wave equation (requires halo data).
+ * These are cells at indices 1 and local_n.
+ *
+ * local_old: local array containing wave data for t-1
+ * local_current: local array containing wave data for t
+ * local_next: local array to store wave data for t+1 (output)
+ * local_n: number of local data points (excluding halos)
+ * start_index: global starting index for this process's chunk
+ * i_max: total number of data points on a single wave
+ */
+static void compute_borders(
+	double *local_old,
+	double *local_current,
+	double *local_next,
+	int local_n,
+	int start_index,
+	int i_max
+) {
+	const double c = 0.15;
+
+	// Left border (index 1).
+	if (local_n >= 1) {
+		int global_i = start_index;
+		if (global_i == 0 || global_i == i_max - 1) {
+			local_next[1] = 0.0;
+		} else {
+			local_next[1] = 2.0 * local_current[1] - local_old[1]
+				+ c * (local_current[0] - 2.0 * local_current[1]
+					+ local_current[2]);
+		}
+	}
+
+	// Right border (index local_n) - only if different from left border.
+	if (local_n >= 2) {
+		int global_i = start_index + local_n - 1;
+		if (global_i == 0 || global_i == i_max - 1) {
+			local_next[local_n] = 0.0;
+		} else {
+			local_next[local_n] = 2.0 * local_current[local_n] - local_old[local_n]
+				+ c * (local_current[local_n - 1] - 2.0 * local_current[local_n]
+					+ local_current[local_n + 1]);
+		}
+	}
+}
+
+/*
  * Execute the entire wave equation simulation using MPI. Divides the wave
  * points among processes using domain decomposition, exchanging halo cells
  * between neighbours after each timestep.
+ *
+ * This version uses fully non-blocking communication (MPI_Isend and MPI_Irecv)
+ * to maximize overlap of communication with computation of interior cells.
  *
  * i_max: how many data points are on a single wave
  * t_max: how many iterations the simulation should run
@@ -193,9 +262,33 @@ double *simulate(const int i_max, const int t_max, double *old_array,
 	int left_neighbour = (rank > 0) ? rank - 1 : MPI_PROC_NULL;
 	int right_neighbour = (rank < size - 1) ? rank + 1 : MPI_PROC_NULL;
 
+	MPI_Request requests[4];
+
 	for (int t = 0; t < t_max; t++) {
-		exchange_halos(local_current, local_n, left_neighbour, right_neighbour);
-		compute_wave_step(
+		// Start all non-blocking communication (2 sends + 2 receives).
+		start_all_halo_comm(
+			local_current,
+			local_n,
+			left_neighbour,
+			right_neighbour,
+			requests
+		);
+
+		// Compute interior cells while all communication progresses.
+		compute_interior(
+			local_old,
+			local_current,
+			local_next,
+			local_n,
+			start_index,
+			i_max
+		);
+
+		// Wait for all communication to complete.
+		MPI_Waitall(4, requests, MPI_STATUSES_IGNORE);
+
+		// Compute border cells (now we have halo data).
+		compute_borders(
 			local_old,
 			local_current,
 			local_next,
